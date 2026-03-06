@@ -1,5 +1,5 @@
 # 多架构支持: linux/amd64, linux/arm64, linux/arm/v7
-FROM node:18-alpine
+FROM node:20-alpine
 
 WORKDIR /app
 

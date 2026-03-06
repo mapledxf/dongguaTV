@@ -1,0 +1,14 @@
+services:
+  dongguatv:
+    build: .
+    container_name: xixitv
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - TMDB_API_KEY=b0f571f9102f143dc888a0cf8b8c36a1
+      - ACCESS_PASSWORD=dxf850620
+    volumes:
+      - ./db.json:/app/db.json
+      - ./cache.db:/app/cache.db
+      - ./cache/images:/app/public/cache/images \
