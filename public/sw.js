@@ -1,8 +1,10 @@
 // Service Worker with Image Caching for dongguaTV
-// v22: Fixed CORS proxy handling and null response errors
-const CACHE_VERSION = 'v22';
+// v25: 直播台标(跨域图片)Cache-First 缓存 + /api/live/channels SWR(秒开)
+const CACHE_VERSION = 'v25';
 const STATIC_CACHE = 'donggua-static-' + CACHE_VERSION;
 const IMAGE_CACHE = 'donggua-images-' + CACHE_VERSION;
+const LIVE_IMG_CACHE = 'donggua-live-img-' + CACHE_VERSION;   // 📺 直播台标(跨域，多域名)
+const MAX_LIVE_IMG = 600;
 
 // 静态资源（应用核心文件）
 const STATIC_URLS = [
@@ -49,7 +51,7 @@ self.addEventListener('activate', event => {
             return Promise.all(
                 cacheNames.map(cacheName => {
                     // 删除所有旧版本缓存
-                    if (cacheName !== STATIC_CACHE && cacheName !== IMAGE_CACHE) {
+                    if (cacheName !== STATIC_CACHE && cacheName !== IMAGE_CACHE && cacheName !== LIVE_IMG_CACHE) {
                         // console.log('[SW] Deleting old cache:', cacheName);
                         return caches.delete(cacheName);
                     }
@@ -74,24 +76,43 @@ self.addEventListener('fetch', event => {
         return;
     }
 
-    // 策略2：HTML 页面 - Network First (确保获取最新版本)
+    // 📺 策略1b：直播台标等【跨域图片】- Cache First(台标在 tb.zbds.top/github 等多个域，按"图片请求"统一缓存)
+    if (url.origin !== self.location.origin &&
+        (event.request.destination === 'image' || /\.(png|jpe?g|webp|gif|svg)(\?|$)/i.test(url.pathname))) {
+        event.respondWith(handleLiveImage(event.request));
+        return;
+    }
+
+    // 📺 策略1c：直播频道列表 - Stale-While-Revalidate(秒显缓存 + 后台更新)
+    if (url.origin === self.location.origin && url.pathname === '/api/live/channels') {
+        event.respondWith(
+            caches.open(STATIC_CACHE).then(cache => cache.match(event.request).then(cached => {
+                const net = fetch(event.request).then(r => { if (r && r.status === 200) cache.put(event.request, r.clone()); return r; }).catch(() => cached);
+                return cached || net;
+            }))
+        );
+        return;
+    }
+
+    // 策略2：HTML 页面 - Stale-While-Revalidate（秒开 + 后台更新）
+    // 立即返回缓存(若有)，同时后台拉取最新版写回缓存；新版本由 index.html 的版本检测脚本 + SW 版本号兜底。
+    // 相比原 Network-First：老用户不再每次重下 ~80-150KB(gzip) HTML，回访明显更快。
     if (event.request.mode === 'navigate' || url.pathname.endsWith('.html') || url.pathname === '/') {
         event.respondWith(
-            fetch(event.request)
-                .then(response => {
-                    // 更新缓存
-                    const responseToCache = response.clone();
-                    caches.open(STATIC_CACHE).then(cache => {
-                        cache.put(event.request, responseToCache);
-                    });
-                    return response;
+            caches.open(STATIC_CACHE).then(cache =>
+                cache.match(event.request).then(cached => {
+                    const network = fetch(event.request)
+                        .then(response => {
+                            if (response && response.status === 200) {
+                                cache.put(event.request, response.clone());
+                            }
+                            return response;
+                        })
+                        .catch(() => cached || new Response('Offline', { status: 503, statusText: 'Service Unavailable' }));
+                    // 有缓存先秒开，后台 network 静默更新；无缓存则等网络
+                    return cached || network;
                 })
-                .catch(() => {
-                    return caches.match(event.request).then(cached => {
-                        // 确保返回有效的 Response，如果缓存也没有则返回离线页面
-                        return cached || new Response('Offline', { status: 503, statusText: 'Service Unavailable' });
-                    });
-                })
+            )
         );
         return;
     }
@@ -180,13 +201,29 @@ async function handleImageRequest(request) {
     }
 }
 
+// 📺 直播台标(跨域)Cache First。<img> 默认 no-cors → opaque 响应，也可缓存。
+async function handleLiveImage(request) {
+    const cache = await caches.open(LIVE_IMG_CACHE);
+    const cached = await cache.match(request);
+    if (cached) return cached;
+    try {
+        const response = await fetch(request);
+        if (response && (response.status === 200 || response.type === 'opaque')) {
+            cache.put(request, response.clone());
+            trimCache(cache, MAX_LIVE_IMG);
+        }
+        return response;
+    } catch (e) {
+        return new Response('', { status: 504 });
+    }
+}
+
 // 清理过多的图片缓存
-async function trimImageCache(cache) {
+async function trimImageCache(cache) { return trimCache(cache, MAX_IMAGE_CACHE); }
+async function trimCache(cache, max) {
     const keys = await cache.keys();
-    if (keys.length > MAX_IMAGE_CACHE) {
-        // 删除最早的缓存（FIFO）
-        const deleteCount = keys.length - MAX_IMAGE_CACHE;
-        // console.log(`[SW] Trimming ${deleteCount} old cached images`);
+    if (keys.length > max) {
+        const deleteCount = keys.length - max;   // FIFO 删最早的
         for (let i = 0; i < deleteCount; i++) {
             await cache.delete(keys[i]);
         }
